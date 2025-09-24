@@ -3,6 +3,7 @@
 #include <string.h>
 #include <windows.h>
 #include <direct.h>
+#include <process.h>
 
 #define MAX_COMMAND_LENGTH 1024
 #define MAX_ARGS 64
@@ -23,6 +24,8 @@ void print_working_directory();
 void clear_screen();
 void handle_exit();
 char *read_input();
+void execute_external_command_windows(char **args);
+int find_executable(char *command, char *full_path);
 
 // Simple input function without readline
 char *read_input()
@@ -184,24 +187,130 @@ void parse_command(char *command, char **args)
     args[i] = NULL;
 }
 
-// Execute external commands (Windows)
-void execute_external_command(char **args)
+// Find executable in PATH (Windows version)
+int find_executable(char *command, char *full_path)
 {
-    // Build command string for system() call
-    char command[MAX_COMMAND_LENGTH] = "";
+    // If command has extension or path, use as-is
+    if (strchr(command, '.') != NULL || strchr(command, '\\') != NULL || strchr(command, '/') != NULL)
+    {
+        if (GetFileAttributesA(command) != INVALID_FILE_ATTRIBUTES)
+        {
+            strcpy(full_path, command);
+            return 1;
+        }
+        return 0;
+    }
+
+    // Check PATH environment variable
+    char *path_env = getenv("PATH");
+    if (path_env == NULL)
+        return 0;
+
+    char path_copy[MAX_COMMAND_LENGTH];
+    strcpy(path_copy, path_env);
+
+    char *dir = strtok(path_copy, ";");
+    while (dir != NULL)
+    {
+        // Try with .exe extension
+        snprintf(full_path, MAX_COMMAND_LENGTH, "%s\\%s.exe", dir, command);
+        if (GetFileAttributesA(full_path) != INVALID_FILE_ATTRIBUTES)
+        {
+            return 1;
+        }
+
+        // Try without extension (for internal commands)
+        snprintf(full_path, MAX_COMMAND_LENGTH, "%s\\%s", dir, command);
+        if (GetFileAttributesA(full_path) != INVALID_FILE_ATTRIBUTES)
+        {
+            return 1;
+        }
+
+        dir = strtok(NULL, ";");
+    }
+
+    return 0;
+}
+
+// Execute external commands using CreateProcess (Windows equivalent of fork/exec)
+void execute_external_command_windows(char **args)
+{
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    DWORD exit_code;
+
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    ZeroMemory(&pi, sizeof(pi));
+
+    // Build command line
+    char command_line[MAX_COMMAND_LENGTH] = "";
     for (int i = 0; args[i] != NULL; i++)
     {
-        strcat(command, args[i]);
+        strcat(command_line, args[i]);
         if (args[i + 1] != NULL)
         {
-            strcat(command, " ");
+            strcat(command_line, " ");
         }
     }
 
-    int result = system(command);
-    if (result == -1)
+    // Try to find the executable
+    char full_path[MAX_COMMAND_LENGTH];
+    if (find_executable(args[0], full_path))
     {
-        perror("system");
+        // Create process with full path
+        if (!CreateProcessA(
+                full_path,    // Executable path
+                command_line, // Command line
+                NULL,         // Process handle not inheritable
+                NULL,         // Thread handle not inheritable
+                FALSE,        // Set handle inheritance to FALSE
+                0,            // No creation flags
+                NULL,         // Use parent's environment block
+                NULL,         // Use parent's starting directory
+                &si,          // Pointer to STARTUPINFO structure
+                &pi)          // Pointer to PROCESS_INFORMATION structure
+        )
+        {
+            // If CreateProcess fails, try with system() as fallback
+            printf("CreateProcess failed (%d). Trying system()...\n", GetLastError());
+            int result = system(command_line);
+            if (result == -1)
+            {
+                printf("Command not found: %s\n", args[0]);
+            }
+            return;
+        }
+    }
+    else
+    {
+        // If we can't find the executable, try system() for internal commands
+        int result = system(command_line);
+        if (result == -1)
+        {
+            printf("Command not found: %s\n", args[0]);
+            return;
+        }
+        else if (result != 0)
+        {
+            printf("Command exited with code %d\n", result);
+        }
+        return;
+    }
+
+    // Wait for process to complete
+    WaitForSingleObject(pi.hProcess, INFINITE);
+
+    // Get exit code
+    GetExitCodeProcess(pi.hProcess, &exit_code);
+
+    // Close process and thread handles
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    if (exit_code != 0)
+    {
+        printf("Process exited with code %lu\n", exit_code);
     }
 }
 
@@ -240,7 +349,7 @@ void handle_command_sequence(char *command)
     }
 }
 
-// Handle background execution (simplified for Windows)
+// Handle background execution (Windows)
 int handle_background_execution(char *command)
 {
     int len = strlen(command);
@@ -306,8 +415,8 @@ void execute_command(char *command)
     {
         if (background)
         {
-            // Background execution (start detached process)
-            char bg_command[MAX_COMMAND_LENGTH + 10];
+            // Background execution using system() with start
+            char bg_command[MAX_COMMAND_LENGTH + 20];
             snprintf(bg_command, sizeof(bg_command), "start /B %s", command);
             system(bg_command);
             printf("[Background process started]\n");
@@ -315,7 +424,7 @@ void execute_command(char *command)
         else
         {
             // Foreground execution
-            execute_external_command(args);
+            execute_external_command_windows(args);
         }
     }
 }
@@ -324,7 +433,7 @@ void execute_command(char *command)
 int main()
 {
     printf("Welcome to Simple Shell (Windows Version)!\n");
-    printf("Type 'exit' to quit.\n\n");
+    printf("Type 'exit' to quit. Supported commands: dir, echo, type, etc.\n\n");
 
     // Initialize current directory
     if (_getcwd(current_dir, sizeof(current_dir)) == NULL)
